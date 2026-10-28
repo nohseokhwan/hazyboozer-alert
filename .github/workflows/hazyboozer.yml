@@ -1,0 +1,272 @@
+name: HazyBoozer Telegram
+
+on:
+  schedule:
+    - cron: '2-57/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '최초 연결은 setup, 감시 시작은 monitor'
+        type: choice
+        default: monitor
+        options:
+          - setup
+          - monitor
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hazyboozer-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check site or connect Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MODE: ${{ inputs.mode || 'monitor' }}
+        run: |
+          python - <<'PYTHON'
+          import argparse
+          import getpass
+          import json
+          import logging
+          import os
+          from pathlib import Path
+          import re
+          import sqlite3
+          import time
+          from html.parser import HTMLParser
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError, URLError
+
+          BASE = 'https://hazyboozer.com'
+
+          class Cards(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.cards = {}
+                  self.current = None
+
+              def handle_starttag(self, tag, attrs):
+                  attrs = dict(attrs)
+                  if tag == 'a':
+                      href = attrs.get('href', '')
+                      self.current = (
+                          {'url': BASE + href, 'title': '', 'parts': []}
+                          if re.fullmatch(r'/packages/[^/?#]+', href)
+                          else None
+                      )
+                  if tag == 'img' and self.current and not self.current['title']:
+                      self.current['title'] = attrs.get('alt', '')
+
+              def handle_data(self, data):
+                  if self.current and data.strip():
+                      self.current['parts'].append(data.strip())
+
+              def handle_endtag(self, tag):
+                  if tag == 'a' and self.current:
+                      card = self.current
+                      card['text'] = ' '.join(card.pop('parts'))
+                      card['title'] = card['title'] or card['text'][:200]
+                      self.cards[card['url']] = card
+                      self.current = None
+
+          def drops(html):
+              parser = Cards()
+              parser.feed(html)
+              if not parser.cards:
+                  raise RuntimeError(
+                      '드랍을 찾지 못했습니다. 사이트 구조 또는 접속 상태를 확인하세요.'
+                  )
+              return list(parser.cards.values())
+
+          def request(url, payload=None):
+              data = json.dumps(payload).encode() if payload is not None else None
+              req = Request(
+                  url,
+                  data=data,
+                  headers={
+                      'User-Agent': 'HazyDropNotifier/1.0',
+                      'Content-Type': 'application/json'
+                  }
+              )
+              try:
+                  with urlopen(req, timeout=30) as response:
+                      return response.read().decode('utf-8')
+              except HTTPError as error:
+                  raise RuntimeError(
+                      f'HTTP {error.code}: 연결 또는 인증을 확인하세요.'
+                  ) from None
+              except (URLError, TimeoutError, OSError):
+                  raise RuntimeError(
+                      '네트워크 요청 실패. 다음 주기에 재시도합니다.'
+                  ) from None
+
+          def telegram(token, method, payload):
+              result = json.loads(
+                  request(
+                      f'https://api.telegram.org/bot{token}/{method}',
+                      payload
+                  )
+              )
+              if not result.get('ok'):
+                  raise RuntimeError('Telegram API 요청 실패')
+              return result['result']
+
+          def message(card):
+              price = re.search(r'₩[\d,]+', card['text'])
+              status = (
+                  '품절' if '품절' in card['text']
+                  else '구매 가능' if '구매 가능' in card['text']
+                  else '상세 페이지 확인'
+              )
+              return (
+                  f"🍺 HazyBoozer 신규 드랍\n"
+                  f"{card['title'][:500]}\n"
+                  f"{price.group() if price else '가격 확인 필요'} · {status}\n"
+                  f"{card['url']}"
+              )
+
+          def tick(db, cards, send):
+              initialized = db.execute(
+                  "SELECT 1 FROM meta WHERE key='initialized'"
+              ).fetchone()
+              if not initialized:
+                  with db:
+                      db.executemany(
+                          'INSERT OR IGNORE INTO seen(url) VALUES (?)',
+                          [(c['url'],) for c in cards]
+                      )
+                      db.execute(
+                          "INSERT INTO meta(key) VALUES ('initialized')"
+                      )
+                  return
+              for card in reversed(cards):
+                  if db.execute(
+                      'SELECT 1 FROM seen WHERE url=?',
+                      (card['url'],)
+                  ).fetchone():
+                      continue
+                  send(message(card))
+                  with db:
+                      db.execute(
+                          'INSERT OR IGNORE INTO seen(url) VALUES (?)',
+                          (card['url'],)
+                      )
+                  time.sleep(1)
+
+          def run():
+              token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
+              if not token:
+                  raise RuntimeError(
+                      'TELEGRAM_BOT_TOKEN secret을 등록하세요.'
+                  )
+
+              if os.environ.get('MODE') == 'setup':
+                  updates = telegram(token, 'getUpdates', {'limit': 100})
+                  chats = {
+                      str(u['message']['chat']['id'])
+                      for u in updates
+                      if 'message' in u
+                      and u['message']['chat']['type'] == 'private'
+                      and u['message'].get('text', '').strip().split('@')[0] == '/start'
+                  }
+                  if len(chats) != 1:
+                      raise RuntimeError(
+                          '전용 봇에 본인만 /start를 보낸 뒤 다시 실행하세요. '
+                          '최근 /start 대화가 정확히 1개여야 합니다.'
+                      )
+                  cid = next(iter(chats))
+                  telegram(
+                      token,
+                      'sendMessage',
+                      {
+                          'chat_id': cid,
+                          'text': (
+                              '연결 확인용 chat_id: ' + cid
+                              + '\n이 숫자를 GitHub의 TELEGRAM_CHAT_ID '
+                              'secret에 저장한 뒤 monitor로 실행하세요.'
+                          )
+                      }
+                  )
+                  print('chat_id를 텔레그램으로 전송했습니다.')
+                  return
+
+              cid = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
+              if not re.fullmatch(r'[0-9]+', cid):
+                  raise RuntimeError(
+                      'setup 실행 후 TELEGRAM_CHAT_ID secret에 '
+                      '본인 숫자 ID를 저장하세요.'
+                  )
+
+              cards = drops(request(BASE))
+              Path('state').mkdir(exist_ok=True)
+              with sqlite3.connect('state/drops.db') as db:
+                  db.execute(
+                      'CREATE TABLE IF NOT EXISTS seen(url TEXT PRIMARY KEY)'
+                  )
+                  db.execute(
+                      'CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY)'
+                  )
+                  first = not db.execute(
+                      "SELECT 1 FROM meta WHERE key='initialized'"
+                  ).fetchone()
+
+                  def send(text):
+                      telegram(
+                          token,
+                          'sendMessage',
+                          {
+                              'chat_id': cid,
+                              'text': text,
+                              'link_preview_options': {'is_disabled': True}
+                          }
+                      )
+
+                  if first:
+                      send(
+                          '🍺 HazyBoozer 감시 시작. '
+                          '현재 드랍은 기준선으로 저장하고, '
+                          '다음 점검부터 새 드랍만 알립니다.'
+                      )
+                  tick(db, cards, send)
+              print('사이트 점검 완료')
+
+          if __name__ == '__main__':
+              try:
+                  run()
+              except Exception as error:
+                  print(
+                      '실행 실패:',
+                      str(error)
+                      if isinstance(error, RuntimeError)
+                      else type(error).__name__
+                  )
+                  raise SystemExit(1)
+          PYTHON
+
+      - name: Save sent-drop history
+        if: ${{ always() }}
+        run: |
+          if [ ! -f state/drops.db ]; then exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/drops.db
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "Save HazyBoozer drop history"
+          git pull --rebase origin "${{ github.event.repository.default_branch }}"
+          git push origin "HEAD:${{ github.event.repository.default_branch }}"
